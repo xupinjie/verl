@@ -134,6 +134,7 @@ def collect_all_to_all(worker_group, output):
     return output
 
 
+# TODO: merge with changes proposed in https://github.com/verl-project/verl/pull/5450
 def _concat_data_proto_or_future(output: list):
     from verl.protocol import BatchData
 
