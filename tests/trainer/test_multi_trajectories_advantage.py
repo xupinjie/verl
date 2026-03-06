@@ -30,6 +30,7 @@ def batch_data() -> DataProto:
                 [200, 200, 0, 0],
                 [150, 0, 0, 150],
                 [4, 5, 6, 7],
+                [8, 9, 10, 11],
             ],
             dtype=torch.float32,
         ),
@@ -38,14 +39,15 @@ def batch_data() -> DataProto:
                 [1, 0, 0, 0],
                 [1, 1, 1, 1],
                 [1, 0, 1, 0],
-                [1, 0, 0, 1],
+                [0, 1, 0, 1],
                 [1, 1, 0, 1],
+                [0, 0, 0, 0],
             ],
             dtype=torch.long,
         ),
     }
     non_tensors = {
-        "uid": np.array(["prompt_a"] * 5, dtype=object),
+        "uid": np.array(["prompt_a"] * 6, dtype=object),
     }
     return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
 
@@ -67,14 +69,18 @@ def test_compute_advantage_for_single_trajectory(batch_data: DataProto):
 def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
     result = compute_advantage_for_multi_trajectories(
         data=batch_data,
-        batch_keys=["prompt_a_0_0", "prompt_a_0_1", "prompt_a_2_0", "prompt_a_2_1", "prompt_a_3_0"],
+        batch_keys=["prompt_a_0_0", "prompt_a_0_1", "prompt_a_2_0", "prompt_a_2_1", "prompt_a_3_0", "prompt_a_4_0"],
         adv_estimator=AdvantageEstimator.GRPO,
     )
     expected = compute_advantage(
-        batch_data.select_idxs([1, 3, 4]),
+        batch_data.select_idxs([1, 3, 4, 5]),
         adv_estimator=AdvantageEstimator.GRPO,
     )
-    gather_indices = [0, 0, 1, 1, 2]
-    adv_expected = expected.batch["advantages"][gather_indices, 0].unsqueeze(-1) * result.batch["response_mask"]
+    gather_row_indices = [0, 0, 1, 1, 2, 3]
+    gather_col_indices = [0, 0, 1, 1, 0, 0]
+    adv_expected = (
+        expected.batch["advantages"][gather_row_indices, gather_col_indices].unsqueeze(-1)
+        * result.batch["response_mask"]
+    )
     assert torch.equal(result.batch["advantages"], adv_expected)
     assert torch.equal(result.batch["returns"], adv_expected)

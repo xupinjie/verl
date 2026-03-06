@@ -155,7 +155,8 @@ def compute_advantage_for_multi_trajectories(
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         config=config,
     )
-    final_scores = final_data.batch["advantages"][:, 0]
+    first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+    final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
 
     # scatter final scores to all rows in batch data
     scores = final_scores[row_to_local_index]
