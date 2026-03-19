@@ -275,9 +275,10 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
-        # 1, dynamic_bs_split, layer_num, topk
+        # Transfer uint8 to GPU first (8x smaller H2D), then convert to int64 on GPU
+        # (NCCL scatter may not support uint8, so int64 conversion is needed before scatter)
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+            layers_topk_idx_rmpad.to(device_name).to(torch.int64).squeeze(dim=0)
         ).unsqueeze(dim=0)
 
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk

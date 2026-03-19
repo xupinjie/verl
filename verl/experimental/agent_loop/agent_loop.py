@@ -175,7 +175,10 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
-            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
+            re_tensor = torch.tensor(routed_experts)
+            if re_tensor.max() <= 255:
+                re_tensor = re_tensor.to(torch.uint8)
+            output["routed_experts"] = re_tensor
 
         # rm_scores: reward score for each token
         reward_score = output.pop("reward_score", None)
