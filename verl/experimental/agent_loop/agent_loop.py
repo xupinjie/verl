@@ -605,12 +605,17 @@ class AgentLoopWorker:
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
+        _t_rollout_start = _time.time()
         outputs = await asyncio.gather(*tasks)
+        _t_rollout_end = _time.time()
 
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
-        output.meta_info["worker_compute_time"] = _time.time() - _t_worker_start
+        _t_postprocess_end = _time.time()
+        output.meta_info["worker_compute_time"] = _t_postprocess_end - _t_worker_start
+        output.meta_info["rollout_time"] = _t_rollout_end - _t_rollout_start
+        output.meta_info["postprocess_time"] = _t_postprocess_end - _t_rollout_end
         return output
 
     async def _run_agent_loop(
@@ -1253,19 +1258,42 @@ class AgentLoopManager:
 
         # Compute per-worker transfer time and log the max
         per_worker_transfer = []
+        per_worker_rollout = []
+        per_worker_postprocess = []
         for i, out in enumerate(outputs):
             worker_compute = out.meta_info.pop("worker_compute_time", per_worker_rpc[i])
             transfer = max(per_worker_rpc[i] - worker_compute, 0.0)
             per_worker_transfer.append(transfer)
+            per_worker_rollout.append(out.meta_info.pop("rollout_time", 0.0))
+            per_worker_postprocess.append(out.meta_info.pop("postprocess_time", 0.0))
         gen_transfer_time = max(per_worker_transfer) if per_worker_transfer else 0.0
+        gen_rollout_time = max(per_worker_rollout) if per_worker_rollout else 0.0
+        gen_postprocess_time = max(per_worker_postprocess) if per_worker_postprocess else 0.0
         global_steps = prompts.meta_info.get("global_steps", 0)
         print(
             f"[TRANSFER_TIMING] step={global_steps} phase=gen op=transfer_time "
             f"elapsed_s={gen_transfer_time:.4f} bytes=0 mode=baseline",
             flush=True,
         )
+        print(
+            f"[TRANSFER_TIMING] step={global_steps} phase=gen op=rollout_time "
+            f"elapsed_s={gen_rollout_time:.4f} bytes=0 mode=baseline",
+            flush=True,
+        )
+        print(
+            f"[TRANSFER_TIMING] step={global_steps} phase=gen op=postprocess_time "
+            f"elapsed_s={gen_postprocess_time:.4f} bytes=0 mode=baseline",
+            flush=True,
+        )
 
+        _t_concat_start = _time.time()
         output = DataProto.concat(outputs)
+        _t_concat_end = _time.time()
+        print(
+            f"[TRANSFER_TIMING] step={global_steps} phase=gen op=concat_time "
+            f"elapsed_s={_t_concat_end - _t_concat_start:.4f} bytes=0 mode=baseline",
+            flush=True,
+        )
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

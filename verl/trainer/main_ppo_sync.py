@@ -459,22 +459,26 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         Returns dict with:
           gen_wall_time: total wall time from generate_sequences start to last tq_put
+          rollout_time: time from gen start to last inference completion (pure rollout)
           last_inference_time: timestamp of last inference completion
           gen_end: timestamp of last tq_put completion
           uncovered_transfer: time after last inference that was spent on postprocess + tq_put
         """
         gen_wall = self._gen_end - self._gen_start if self._gen_end > 0 else 0.0
+        rollout = max(self._last_inference_time - self._gen_start, 0.0) if self._last_inference_time > 0 else 0.0
         uncovered = max(self._gen_end - self._last_inference_time, 0.0) if self._gen_end > 0 else 0.0
         import os
         worker_id = os.getpid()
         print(
             f"[GEN_TIMING] worker={worker_id} gen_wall={gen_wall:.4f}s "
+            f"rollout={rollout:.4f}s "
             f"last_inference={self._last_inference_time:.4f} gen_end={self._gen_end:.4f} "
             f"uncovered_transfer={uncovered:.4f}s",
             flush=True,
         )
         return {
             "gen_wall_time": gen_wall,
+            "rollout_time": rollout,
             "uncovered_transfer": uncovered,
         }
 
@@ -1516,10 +1520,12 @@ class PPOTrainer:
             [w.get_gen_timing.remote() for w in self.async_rollout_manager.agent_loop_workers]
         )
         max_worker_wall = max(t["gen_wall_time"] for t in worker_timings) if worker_timings else 0.0
+        max_rollout = max(t.get("rollout_time", 0.0) for t in worker_timings) if worker_timings else 0.0
         max_uncovered = max(t["uncovered_transfer"] for t in worker_timings) if worker_timings else 0.0
         gen_transfer_time = max(sample_wait - max_worker_wall, 0.0)
         _log_transfer_timing(self.global_steps, "gen", "transfer_time", max_uncovered)
         _log_transfer_timing(self.global_steps, "gen", "compute_time", max_worker_wall)
+        _log_transfer_timing(self.global_steps, "gen", "rollout_time", max_rollout)
         _log_transfer_timing(self.global_steps, "gen", "sample_overhead", gen_transfer_time)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
