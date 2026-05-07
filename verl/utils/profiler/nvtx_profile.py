@@ -23,6 +23,29 @@ import torch
 from .config import NsightToolConfig
 from .profile import DistProfiler, ProfilerConfig
 
+# When False, NVTX ranges are not emitted (only timing is still recorded).
+# Used to restrict profiling to "train+rollout" steps and skip init.
+_nvtx_emit_enabled = True
+
+
+def set_nvtx_emit_enabled(enable: bool) -> None:
+    """Enable or disable NVTX range emission for the current process.
+
+    When disabled, marked_timer and TQ NVTX helpers will not push NVTX ranges,
+    so nsys traces only show the key parts (e.g. one full train+rollout step)
+    and skip init and other steps.
+
+    Args:
+        enable: True to emit NVTX ranges, False to skip.
+    """
+    global _nvtx_emit_enabled
+    _nvtx_emit_enabled = enable
+
+
+def is_nvtx_emit_enabled() -> bool:
+    """Return whether NVTX range emission is currently enabled."""
+    return _nvtx_emit_enabled
+
 
 def mark_start_range(
     message: Optional[str] = None,
@@ -104,11 +127,14 @@ def marked_timer(
     Yields:
         None: This is a context manager that yields control back to the code block.
     """
-    mark_range = mark_start_range(message=name, color=color, domain=domain, category=category)
     from .performance import _timer
 
-    yield from _timer(name, timing_raw)
-    mark_end_range(mark_range)
+    if is_nvtx_emit_enabled():
+        mark_range = mark_start_range(message=name, color=color, domain=domain, category=category)
+        yield from _timer(name, timing_raw)
+        mark_end_range(mark_range)
+    else:
+        yield from _timer(name, timing_raw)
 
 
 class NsightSystemsProfiler(DistProfiler):

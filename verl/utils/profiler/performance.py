@@ -151,6 +151,16 @@ def _timer(name: str, timing_raw: dict[str, float]):
     timing_raw[name] += timer.last
 
 
+def set_nvtx_emit_enabled(enable: bool) -> None:
+    """No-op when NVTX is not available; trainer can always call this."""
+    pass
+
+
+def is_nvtx_emit_enabled() -> bool:
+    """Always True when NVTX is not available."""
+    return True
+
+
 @contextmanager
 def simple_timer(name: str, timing_raw: dict[str, float]):
     """Context manager for basic timing without NVTX markers.
@@ -238,6 +248,76 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
     top_k_percentile = torch.quantile(tensor_stack, 1 - k / 100)
     tail_ratio = torch.mean((tensor_stack > top_k_percentile).float()).cpu().item()
     return tail_ratio, timing_min, timing_max
+
+
+###############################################################################
+# TransferTimeLogger – Ray Actor for cross-process transfer time measurement
+###############################################################################
+
+import ray
+
+_transfer_time_logger = None  # module-level singleton handle
+
+
+def _get_or_create_logger():
+    """Lazily create or retrieve the TransferTimeLogger singleton."""
+    global _transfer_time_logger
+    if _transfer_time_logger is None:
+        try:
+            _transfer_time_logger = ray.get_actor("TransferTimeLogger")
+        except ValueError:
+            _transfer_time_logger = TransferTimeLogger.options(
+                name="TransferTimeLogger", lifetime="detached"
+            ).remote()
+    return _transfer_time_logger
+
+
+@ray.remote
+class TransferTimeLogger:
+    """Collects worker-side compute times reported from tqbridge decorator.
+
+    Workers call ``log_worker_compute(task_name, elapsed_s)`` after each
+    function execution.  The controller calls ``flush_worker_compute(task_name)``
+    to retrieve ``max(elapsed_s)`` across all workers for that task, which it
+    then subtracts from rpc_total to obtain the pure transfer time.
+    """
+
+    def __init__(self):
+        from collections import defaultdict
+
+        self.worker_compute: dict[str, list[float]] = defaultdict(list)
+
+    def log_worker_compute(self, task_name: str, elapsed_s: float):
+        self.worker_compute[task_name].append(elapsed_s)
+
+    def flush_all(self) -> float:
+        """Return max worker compute time across all tasks and clear the buffer.
+
+        Since training phases are sequential, the buffer should only contain
+        entries from the most recent RPC call.
+        """
+        all_times = []
+        for times in self.worker_compute.values():
+            all_times.extend(times)
+        self.worker_compute.clear()
+        return max(all_times) if all_times else 0.0
+
+
+def log_worker_compute(task_name: str, elapsed_s: float):
+    """Called from worker processes (inside tqbridge) to report compute time."""
+    import ray
+
+    logger_actor = _get_or_create_logger()
+    # Fire-and-forget: don't block the worker
+    logger_actor.log_worker_compute.remote(task_name, elapsed_s)
+
+
+def flush_worker_compute() -> float:
+    """Called from controller to get max worker compute time and clear buffer."""
+    import ray
+
+    logger_actor = _get_or_create_logger()
+    return ray.get(logger_actor.flush_all.remote())
 
 
 def gather_timing(timing_raw: dict[str, float]) -> dict[str, list[float]]:

@@ -36,6 +36,7 @@ import hydra
 import numpy as np
 import ray
 import torch
+import torch.cuda.nvtx as nvtx
 
 try:
     import transfer_queue as tq
@@ -80,6 +81,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass, validate_config
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
+from verl.utils.profiler.performance import flush_worker_compute
 from verl.utils.debug.metrics import calculate_debug_metrics
 from verl.utils.device import auto_set_device
 from verl.utils.fs import copy_to_local
@@ -97,6 +99,25 @@ from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _compute_td_bytes(data) -> int:
+    """Compute total bytes of tensors in a TensorDict."""
+    total = 0
+    for key in data.keys():
+        val = data[key]
+        if hasattr(val, "numel") and hasattr(val, "element_size"):
+            total += val.numel() * val.element_size()
+    return total
+
+
+def _log_transfer_timing(step, phase, op, elapsed_s, data_bytes=0, mode="tq"):
+    """Log structured transfer timing for parsing by the plotting script."""
+    print(
+        f"[TRANSFER_TIMING] step={step} phase={phase} op={op} "
+        f"elapsed_s={elapsed_s:.4f} bytes={data_bytes} mode={mode}",
+        flush=True,
+    )
 
 
 # ======================================= USER SECTION BEGIN =======================================
@@ -272,9 +293,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        self._gen_start = 0.0
+        self._gen_end = 0.0
+        self._last_inference_time = 0.0
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
+        self._gen_start = time.time()
+        self._gen_end = 0.0
+        self._last_inference_time = 0.0
+        nvtx.range_push(f"agent_loop_tq::generate_sequences(bsz={len(batch)})")
         validate = batch["validate"] if "validate" in batch else False
         batch.pop("validate", None)
         config = self.config.actor_rollout_ref.rollout
@@ -320,6 +348,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
+        nvtx.range_pop()  # generate_sequences
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
@@ -345,6 +374,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
+        # Record inference completion: agent_loop.run() has returned, inference is done
+        self._last_inference_time = max(self._last_inference_time, time.time())
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
@@ -421,6 +452,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+        self._gen_end = max(self._gen_end, time.time())
+
+    def get_gen_timing(self) -> dict:
+        """Return gen phase timing and print per-worker summary.
+
+        Returns dict with:
+          gen_wall_time: total wall time from generate_sequences start to last tq_put
+          last_inference_time: timestamp of last inference completion
+          gen_end: timestamp of last tq_put completion
+          uncovered_transfer: time after last inference that was spent on postprocess + tq_put
+        """
+        gen_wall = self._gen_end - self._gen_start if self._gen_end > 0 else 0.0
+        uncovered = max(self._gen_end - self._last_inference_time, 0.0) if self._gen_end > 0 else 0.0
+        import os
+        worker_id = os.getpid()
+        print(
+            f"[GEN_TIMING] worker={worker_id} gen_wall={gen_wall:.4f}s "
+            f"last_inference={self._last_inference_time:.4f} gen_end={self._gen_end:.4f} "
+            f"uncovered_transfer={uncovered:.4f}s",
+            flush=True,
+        )
+        return {
+            "gen_wall_time": gen_wall,
+            "uncovered_transfer": uncovered,
+        }
 
 
 class AgentLoopManagerTQ(AgentLoopManager):
@@ -1039,8 +1095,13 @@ class PPOTrainer:
 
         # 1. compute log probs
         batch.extra_info.update({"calculate_entropy": True, "compute_loss": False})
+        _tq_transfer_acc = 0.0
+        _tq_bytes_acc = 0
+        t_rpc_start = time.time()
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
+        t_rpc_end = time.time()
         assert len(output) == len(batch)
+        _log_transfer_timing(self.global_steps, "old_log_prob", "compute_rpc", t_rpc_end - t_rpc_start)
 
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -1048,17 +1109,24 @@ class PPOTrainer:
         t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         t_end = time.time()
-        print(f"[DEBUG] _compute_old_log_prob time to get data: {t_end - t_start:.2f}", flush=True)
+        get_bytes = _compute_td_bytes(data)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += get_bytes
+        _log_transfer_timing(self.global_steps, "old_log_prob", "tq_get", t_end - t_start, data_bytes=get_bytes)
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        put_data = data.select("old_log_probs", "entropy")
+        put_bytes = _compute_td_bytes(put_data)
         t_start = time.time()
-        tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
-        )
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_data)
         t_end = time.time()
-        print(f"[DEBUG] _compute_old_log_prob time to put data: {t_end - t_start:.2f}", flush=True)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += put_bytes
+        _log_transfer_timing(self.global_steps, "old_log_prob", "tq_put", t_end - t_start, data_bytes=put_bytes)
+        _log_transfer_timing(self.global_steps, "old_log_prob", "transfer_time", _tq_transfer_acc,
+                             data_bytes=_tq_bytes_acc)
 
         data = DataProto(batch=data.to_padded_tensor())
 
@@ -1085,15 +1153,20 @@ class PPOTrainer:
     def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the reference log prob of the batch."""
         # 1. compute log probs
+        _tq_transfer_acc = 0.0
+        _tq_bytes_acc = 0
         metadata = {"calculate_entropy": False, "compute_loss": False}
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
         batch.extra_info.update(metadata)
+        t_rpc_start = time.time()
         if self.ref_in_actor:
             output = self.actor_rollout_wg.compute_log_prob(batch)
         else:
             output = self.ref_policy_wg.compute_ref_log_prob(batch)
+        t_rpc_end = time.time()
         assert len(output) == len(batch)
+        _log_transfer_timing(self.global_steps, "ref", "compute_rpc", t_rpc_end - t_rpc_start)
 
         # 2. write ref_log_prob and entropy back to TransferQueue
         t_start = time.time()
@@ -1101,21 +1174,35 @@ class PPOTrainer:
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
         )
         t_end = time.time()
-        print(f"[DEBUG] _compute_ref_log_prob time to get data: {t_end - t_start:.2f}", flush=True)
+        get_bytes = _compute_td_bytes(data)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += get_bytes
+        _log_transfer_timing(self.global_steps, "ref", "tq_get", t_end - t_start, data_bytes=get_bytes)
         data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+        put_data = data.select("ref_log_prob")
+        put_bytes = _compute_td_bytes(put_data)
         t_start = time.time()
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_data)
         t_end = time.time()
-        print(f"[DEBUG] _compute_ref_log_prob time to put data: {t_end - t_start:.2f}", flush=True)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += put_bytes
+        _log_transfer_timing(self.global_steps, "ref", "tq_put", t_end - t_start, data_bytes=put_bytes)
+        _log_transfer_timing(self.global_steps, "ref", "transfer_time", _tq_transfer_acc,
+                             data_bytes=_tq_bytes_acc)
 
         return batch
 
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""
+        _tq_transfer_acc = 0.0
+        _tq_bytes_acc = 0
         # 1. compute value
+        t_rpc_start = time.time()
         output = self.critic_wg.infer_batch(batch)
         # TODO: DataProtoFuture support KVBatchMeta
         ray.get(output.futures)
+        t_rpc_end = time.time()
+        _log_transfer_timing(self.global_steps, "values", "compute_rpc", t_rpc_end - t_rpc_start)
 
         # 2. write value back to TransferQueue
         t_start = time.time()
@@ -1123,23 +1210,37 @@ class PPOTrainer:
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
         )
         t_end = time.time()
-        print(f"[DEBUG] _compute_values time to get data: {t_end - t_start:.2f}", flush=True)
+        get_bytes = _compute_td_bytes(data)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += get_bytes
+        _log_transfer_timing(self.global_steps, "values", "tq_get", t_end - t_start, data_bytes=get_bytes)
         data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+        put_data = data.select("values")
+        put_bytes = _compute_td_bytes(put_data)
         t_start = time.time()
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_data)
         t_end = time.time()
-        print(f"[DEBUG] _compute_values time to put data: {t_end - t_start:.2f}", flush=True)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += put_bytes
+        _log_transfer_timing(self.global_steps, "values", "tq_put", t_end - t_start, data_bytes=put_bytes)
+        _log_transfer_timing(self.global_steps, "values", "transfer_time", _tq_transfer_acc,
+                             data_bytes=_tq_bytes_acc)
 
         return batch
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        _tq_transfer_acc = 0.0
+        _tq_bytes_acc = 0
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         response_mask = data["response_mask"]
         t_end = time.time()
-        print(f"[DEBUG] _compute_advantage time to get data: {t_end - t_start:.2f}", flush=True)
+        get_bytes = _compute_td_bytes(data)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += get_bytes
+        _log_transfer_timing(self.global_steps, "adv", "tq_get", t_end - t_start, data_bytes=get_bytes)
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
@@ -1190,10 +1291,15 @@ class PPOTrainer:
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
+        put_bytes = _compute_td_bytes(output)
         t_start = time.time()
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
         t_end = time.time()
-        print(f"[DEBUG] _compute_advantage time to put data: {t_end - t_start:.2f}", flush=True)
+        _tq_transfer_acc += t_end - t_start
+        _tq_bytes_acc += put_bytes
+        _log_transfer_timing(self.global_steps, "adv", "tq_put", t_end - t_start, data_bytes=put_bytes)
+        _log_transfer_timing(self.global_steps, "adv", "transfer_time", _tq_transfer_acc,
+                             data_bytes=_tq_bytes_acc)
 
         return batch
 
@@ -1210,8 +1316,16 @@ class PPOTrainer:
         }
         batch.extra_info.update(extra_info)
 
+        t_rpc_start = time.time()
         output: DataProtoFuture = self.critic_wg.train_mini_batch(batch)
         output: TensorDict = output.get()
+        t_rpc_end = time.time()
+        rpc_total = t_rpc_end - t_rpc_start
+        compute_time = flush_worker_compute()
+        transfer_time = max(rpc_total - compute_time, 0.0)
+        _log_transfer_timing(self.global_steps, "update_critic", "transfer_time", transfer_time)
+        _log_transfer_timing(self.global_steps, "update_critic", "rpc_total", rpc_total)
+        _log_transfer_timing(self.global_steps, "update_critic", "compute_time", compute_time)
         output = rename_dict(output["metrics"], "critic/")
         output["perf/mfu/critic"] = output.pop("critic/mfu")
         critic_metrics = reduce_metrics(output)
@@ -1234,7 +1348,15 @@ class PPOTrainer:
         }
         batch.extra_info.update(extra_info)
 
+        t_rpc_start = time.time()
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        t_rpc_end = time.time()
+        rpc_total = t_rpc_end - t_rpc_start
+        compute_time = flush_worker_compute()
+        transfer_time = max(rpc_total - compute_time, 0.0)
+        _log_transfer_timing(self.global_steps, "update_actor", "transfer_time", transfer_time)
+        _log_transfer_timing(self.global_steps, "update_actor", "rpc_total", rpc_total)
+        _log_transfer_timing(self.global_steps, "update_actor", "compute_time", compute_time)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
@@ -1357,7 +1479,14 @@ class PPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                # 5. record metrics
+                # 5. emit phase_total timing for each phase
+                for phase_name in ["gen", "reward", "old_log_prob", "ref", "values", "adv",
+                                   "update_critic", "update_actor"]:
+                    if phase_name in timing_raw:
+                        _log_transfer_timing(self.global_steps, phase_name, "phase_total",
+                                             timing_raw[phase_name])
+
+                # 6. record metrics
                 self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
 
                 # 6. cleanup transfer queue and replay buffer
@@ -1382,6 +1511,16 @@ class PPOTrainer:
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+        sample_wait = timing_raw.get("gen", 0.0)
+        worker_timings = ray.get(
+            [w.get_gen_timing.remote() for w in self.async_rollout_manager.agent_loop_workers]
+        )
+        max_worker_wall = max(t["gen_wall_time"] for t in worker_timings) if worker_timings else 0.0
+        max_uncovered = max(t["uncovered_transfer"] for t in worker_timings) if worker_timings else 0.0
+        gen_transfer_time = max(sample_wait - max_worker_wall, 0.0)
+        _log_transfer_timing(self.global_steps, "gen", "transfer_time", max_uncovered)
+        _log_transfer_timing(self.global_steps, "gen", "compute_time", max_worker_wall)
+        _log_transfer_timing(self.global_steps, "gen", "sample_overhead", gen_transfer_time)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
 

@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -63,6 +64,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.profiler.performance import flush_worker_compute
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
@@ -72,6 +74,96 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _log_transfer_size(data, phase: str, direction: str = "SEND"):
+    """Log detailed data transfer size for DataProto or TensorDict via Ray Object Store.
+
+    Args:
+        data: DataProto or TensorDict to measure.
+        phase: Name of the training phase (e.g. "old_log_prob", "update_actor").
+        direction: "SEND" for Trainer→Worker, "RECV" for Worker→Trainer.
+    """
+    from tensordict import TensorDict
+
+    separator = "=" * 90
+    arrow = ">>>" if direction == "SEND" else "<<<"
+    header = f" {arrow} {direction}: {phase} (Legacy / Ray Object Store) {arrow} "
+    print(f"\n{separator}", flush=True)
+    print(f"{header:=^90}", flush=True)
+
+    # extract tensors
+    tensor_items = {}
+    if isinstance(data, DataProto):
+        for key in sorted(data.batch.keys()):
+            tensor_items[key] = data.batch[key]
+    elif isinstance(data, TensorDict):
+        for key in sorted(data.keys()):
+            val = data[key]
+            if isinstance(val, torch.Tensor):
+                tensor_items[key] = val
+    else:
+        print(f"  [unknown data type: {type(data)}]", flush=True)
+        print(f"{separator}\n", flush=True)
+        return 0
+
+    if not tensor_items:
+        print("  (no tensor fields)", flush=True)
+        print(f"{separator}\n", flush=True)
+        return 0
+
+    total_bytes = 0
+    rows = []
+    for key, tensor in tensor_items.items():
+        nbytes = tensor.numel() * tensor.element_size()
+        total_bytes += nbytes
+        rows.append((key, tuple(tensor.shape), str(tensor.dtype), nbytes))
+
+    col_w = [max(len(r[0]) for r in rows) + 2, 32, 18, 16]
+    fmt = f"  {{:<{col_w[0]}}} {{:<{col_w[1]}}} {{:<{col_w[2]}}} {{:>{col_w[3]}}}"
+    print(fmt.format("Field", "Shape", "Dtype", "Size"), flush=True)
+    print(f"  {'-' * sum(col_w)}", flush=True)
+    for name, shape, dtype, nbytes in rows:
+        if nbytes >= 1024**3:
+            size_str = f"{nbytes / (1024**3):.4f} GB"
+        elif nbytes >= 1024**2:
+            size_str = f"{nbytes / (1024**2):.2f} MB"
+        else:
+            size_str = f"{nbytes / 1024:.2f} KB"
+        print(fmt.format(name, str(shape), dtype, size_str), flush=True)
+
+    print(f"  {'-' * sum(col_w)}", flush=True)
+    total_str = f"{total_bytes / (1024**3):.4f} GB" if total_bytes >= 1024**3 else f"{total_bytes / (1024**2):.2f} MB"
+    print(f"  {arrow} TOTAL {direction} for [{phase}]: {total_str} ({total_bytes:,} bytes)", flush=True)
+    print(f"{separator}\n", flush=True)
+    return total_bytes
+
+
+def _compute_td_bytes(data) -> int:
+    """Compute total bytes of tensors in a DataProto or TensorDict."""
+    from tensordict import TensorDict
+
+    total = 0
+    if isinstance(data, DataProto):
+        for key in data.batch.keys():
+            t = data.batch[key]
+            if hasattr(t, "numel"):
+                total += t.numel() * t.element_size()
+    elif isinstance(data, TensorDict):
+        for key in data.keys():
+            val = data[key]
+            if hasattr(val, "numel") and hasattr(val, "element_size"):
+                total += val.numel() * val.element_size()
+    return total
+
+
+def _log_transfer_timing(step, phase, op, elapsed_s, data_bytes=0, mode="baseline"):
+    """Log structured transfer timing for parsing by the plotting script."""
+    print(
+        f"[TRANSFER_TIMING] step={step} phase={phase} op={op} "
+        f"elapsed_s={elapsed_s:.4f} bytes={data_bytes} mode={mode}",
+        flush=True,
+    )
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1135,35 +1227,63 @@ class RayPPOTrainer:
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
             tu.assign_non_tensor(batch_td, compute_loss=False)
+            send_bytes = _log_transfer_size(batch_td, "compute_values", "SEND")
+            t_rpc_start = time.time()
             output = self.critic_wg.infer_batch(batch_td)
             output = output.get()
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(output, "compute_values", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "values", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "values", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "values", "compute_time", compute_time)
             values = tu.get(output, "values")
             values = no_padding_2_padding(values, batch_td)
             values = tu.get_tensordict({"values": values.float()})
             values = DataProto.from_tensordict(values)
         else:
+            send_bytes = _log_transfer_size(batch, "compute_values", "SEND")
+            t_rpc_start = time.time()
             values = self.critic_wg.compute_values(batch)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(values, "compute_values", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "values", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "values", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "values", "compute_time", compute_time)
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
-            # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
             metadata = {"calculate_entropy": False, "compute_loss": False}
             if self.ref_in_actor:
                 metadata["no_lora_adapter"] = True
             tu.assign_non_tensor(batch_td, **metadata)
+            send_bytes = _log_transfer_size(batch_td, "compute_ref_log_prob", "SEND")
+            t_rpc_start = time.time()
             if self.ref_in_actor:
                 output = self.actor_rollout_wg.compute_log_prob(batch_td)
             else:
                 output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(output, "compute_ref_log_prob", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "ref", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "ref", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "ref", "compute_time", compute_time)
             # gather output
             log_probs = tu.get(output, "log_probs")
             # step 4. No padding to padding
@@ -1172,20 +1292,38 @@ class RayPPOTrainer:
             ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
             ref_log_prob = DataProto.from_tensordict(ref_log_prob)
         else:
+            send_bytes = _log_transfer_size(batch, "compute_ref_log_prob", "SEND")
+            t_rpc_start = time.time()
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(ref_log_prob, "compute_ref_log_prob", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "ref", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "ref", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "ref", "compute_time", compute_time)
 
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
-            # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-            # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
             tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            send_bytes = _log_transfer_size(batch_td, "compute_old_log_prob", "SEND")
+            t_rpc_start = time.time()
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(output, "compute_old_log_prob", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "compute_time", compute_time)
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
@@ -1204,19 +1342,27 @@ class RayPPOTrainer:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            send_bytes = _log_transfer_size(batch, "compute_old_log_prob", "SEND")
+            t_rpc_start = time.time()
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(old_log_prob, "compute_old_log_prob", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "old_log_prob", "compute_time", compute_time)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
-        # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             distillation_use_topk = (
@@ -1240,21 +1386,43 @@ class RayPPOTrainer:
                 dataloader_kwargs={"shuffle": shuffle},
                 compute_loss=True,
             )
+
+            send_bytes = _log_transfer_size(batch_td, "update_actor", "SEND")
+            t_rpc_start = time.time()
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(actor_output, "update_actor", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "update_actor", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "update_actor", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "update_actor", "compute_time", compute_time)
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
+            send_bytes = _log_transfer_size(batch, "update_actor", "SEND")
+            t_rpc_start = time.time()
             actor_output = self.actor_rollout_wg.update_actor(batch)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(actor_output, "update_actor", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "update_actor", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "update_actor", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "update_actor", "compute_time", compute_time)
 
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -1270,15 +1438,37 @@ class RayPPOTrainer:
                 dataloader_kwargs={"shuffle": shuffle},
             )
 
+            send_bytes = _log_transfer_size(batch_td, "update_critic", "SEND")
+            t_rpc_start = time.time()
             output = self.critic_wg.train_mini_batch(batch_td)
             output = output.get()
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(output, "update_critic", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "update_critic", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "update_critic", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "update_critic", "compute_time", compute_time)
             output = tu.get(output, "metrics")
             output = rename_dict(output, "critic/")
             # modify key name
             output["perf/mfu/critic"] = output.pop("critic/mfu")
             critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         else:
+            send_bytes = _log_transfer_size(batch, "update_critic", "SEND")
+            t_rpc_start = time.time()
             critic_output = self.critic_wg.update_critic(batch)
+            t_rpc_end = time.time()
+            rpc_total = t_rpc_end - t_rpc_start
+            recv_bytes = _log_transfer_size(critic_output, "update_critic", "RECV")
+            compute_time = flush_worker_compute()
+            transfer_time = max(rpc_total - compute_time, 0.0)
+            _log_transfer_timing(self.global_steps, "update_critic", "transfer_time", transfer_time,
+                                 data_bytes=send_bytes + recv_bytes)
+            _log_transfer_timing(self.global_steps, "update_critic", "rpc_total", rpc_total)
+            _log_transfer_timing(self.global_steps, "update_critic", "compute_time", compute_time)
         return critic_output
 
     def fit(self):
@@ -1627,6 +1817,13 @@ class RayPPOTrainer:
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                # emit phase_total timing for each phase
+                for phase_name in ["gen", "reward", "old_log_prob", str(Role.RefPolicy), "values", "adv",
+                                   "update_critic", "update_actor"]:
+                    if phase_name in timing_raw:
+                        _log_transfer_timing(self.global_steps, phase_name, "phase_total",
+                                             timing_raw[phase_name])
 
                 # training metrics
                 metrics.update(

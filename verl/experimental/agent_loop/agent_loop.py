@@ -23,6 +23,7 @@ import hydra
 import numpy as np
 import ray
 import torch
+import torch.cuda.nvtx as nvtx
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
@@ -221,6 +222,10 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
+            # re_tensor = torch.tensor(routed_experts, dtype=torch.int64)
+            # if re_tensor.max() <= 255:
+            #     re_tensor = re_tensor.to(torch.uint8)
+            # output["routed_experts"] = re_tensor
             output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
 
         # rm_scores: reward score for each token
@@ -542,6 +547,10 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        import time as _time
+
+        _t_worker_start = _time.time()
+        nvtx.range_push(f"agent_loop::generate_sequences(bsz={len(batch)})")
         config = self.rollout_config
         sampling_params = dict(
             temperature=config.temperature,
@@ -601,6 +610,7 @@ class AgentLoopWorker:
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
+        output.meta_info["worker_compute_time"] = _time.time() - _t_worker_start
         return output
 
     async def _run_agent_loop(
@@ -985,11 +995,52 @@ class AgentLoopWorker:
         else:
             meta_info = {"metrics": metrics}
 
-        return DataProto(
+        result = DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
+        self._log_data_transfer_size(result)
+        return result
+
+    def _log_data_transfer_size(self, data: DataProto):
+        """Log detailed data transfer size for the DataProto returned via Ray Object Store."""
+        separator = "=" * 80
+        header = " AGENT LOOP DATA TRANSFER SIZE (Legacy / Ray Object Store) "
+        print(f"\n{separator}", flush=True)
+        print(f"{header:=^80}", flush=True)
+        print(f"{separator}", flush=True)
+
+        total_bytes = 0
+        tensor_details = []
+        for key in sorted(data.batch.keys()):
+            tensor = data.batch[key]
+            if isinstance(tensor, torch.Tensor):
+                nbytes = tensor.numel() * tensor.element_size()
+                total_bytes += nbytes
+                tensor_details.append((key, tuple(tensor.shape), str(tensor.dtype), nbytes))
+
+        col_w = [max(len(r[0]) for r in tensor_details) + 2, 30, 16, 16]
+        fmt = f"  {{:<{col_w[0]}}} {{:<{col_w[1]}}} {{:<{col_w[2]}}} {{:>{col_w[3]}}}"
+        print(fmt.format("Field", "Shape", "Dtype", "Size"), flush=True)
+        print(f"  {'-' * sum(col_w)}", flush=True)
+        for name, shape, dtype, nbytes in tensor_details:
+            size_str = f"{nbytes / (1024**3):.4f} GB" if nbytes >= 1024**3 else (
+                f"{nbytes / (1024**2):.2f} MB" if nbytes >= 1024**2 else f"{nbytes / 1024:.2f} KB"
+            )
+            print(fmt.format(name, str(shape), dtype, size_str), flush=True)
+
+        non_tensor_bytes = 0
+        for key, val in data.non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                non_tensor_bytes += val.nbytes
+
+        total_bytes += non_tensor_bytes
+        print(f"  {'-' * sum(col_w)}", flush=True)
+        print(fmt.format("TENSOR TOTAL", "", "", f"{total_bytes / (1024**3):.4f} GB" if total_bytes >= 1024**3 else f"{total_bytes / (1024**2):.2f} MB"), flush=True)
+        print(fmt.format("non_tensor_batch", f"({len(data.non_tensor_batch)} fields)", "", f"{non_tensor_bytes / (1024**2):.2f} MB"), flush=True)
+        print(f"\n  >>> TOTAL DATA VIA RAY OBJECT STORE: {total_bytes / (1024**3):.4f} GB ({total_bytes:,} bytes) <<<", flush=True)
+        print(f"{separator}\n", flush=True)
 
 
 async def get_trajectory_info(step, index, validate):
@@ -1176,17 +1227,44 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        import time as _time
+
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.wake_up()
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = await asyncio.gather(
+
+        # Per-worker timed dispatch to measure individual rpc times
+        async def _timed_generate(worker, chunk):
+            t0 = _time.time()
+            result = await worker.generate_sequences.remote(chunk)
+            return result, _time.time() - t0
+
+        results = await asyncio.gather(
             *[
-                worker.generate_sequences.remote(chunk)
+                _timed_generate(worker, chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        outputs = [r[0] for r in results]
+        per_worker_rpc = [r[1] for r in results]
+
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.sleep()
+
+        # Compute per-worker transfer time and log the max
+        per_worker_transfer = []
+        for i, out in enumerate(outputs):
+            worker_compute = out.meta_info.pop("worker_compute_time", per_worker_rpc[i])
+            transfer = max(per_worker_rpc[i] - worker_compute, 0.0)
+            per_worker_transfer.append(transfer)
+        gen_transfer_time = max(per_worker_transfer) if per_worker_transfer else 0.0
+        global_steps = prompts.meta_info.get("global_steps", 0)
+        print(
+            f"[TRANSFER_TIMING] step={global_steps} phase=gen op=transfer_time "
+            f"elapsed_s={gen_transfer_time:.4f} bytes=0 mode=baseline",
+            flush=True,
+        )
+
         output = DataProto.concat(outputs)
 
         # calculate performance metrics

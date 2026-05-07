@@ -24,6 +24,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
+import torch.cuda.nvtx as nvtx
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 if TYPE_CHECKING:
@@ -127,7 +128,11 @@ async def _async_meta_to_realdata(meta: BatchMeta) -> TensorDict:
 
 
 def _meta_to_realdata(meta: BatchMeta) -> TensorDict:
-    return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
+    """Fetch real tensor data from TQ storage based on metadata."""
+    nvtx.range_push(f"tq::tqbridge_get(n={meta.size})")
+    result = _run_async_in_temp_loop(_async_meta_to_realdata, meta)
+    nvtx.range_pop()
+    return result
 
 
 async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
@@ -152,7 +157,11 @@ async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, fu
 
 
 def _update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
+    """Write worker output back to TQ storage."""
+    fields_desc = ",".join(k for k, v in output.items() if isinstance(v, torch.Tensor | NonTensorStack))
+    nvtx.range_push(f"tq::tqbridge_put(n={meta.size},f=[{fields_desc}])")
     updated_meta = _run_async_in_temp_loop(_async_update_meta_with_output, output, meta, func_name)
+    nvtx.range_pop()
     return updated_meta
 
 
@@ -323,7 +332,17 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
         def inner(*args, **kwargs):
             batch_meta = _find_meta(*args, **kwargs)
             if batch_meta is None:
-                return func(*args, **kwargs)
+                # Baseline path: measure pure compute time and report to TransferTimeLogger
+                t_compute_start = time.time()
+                result = func(*args, **kwargs)
+                t_compute_elapsed = time.time() - t_compute_start
+                try:
+                    from verl.utils.profiler.performance import log_worker_compute
+
+                    log_worker_compute(func.__name__, t_compute_elapsed)
+                except Exception:
+                    pass  # profiling should never break training
+                return result
             else:
                 global TQ_INITIALIZED
                 if not TQ_INITIALIZED:
@@ -337,7 +356,15 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
                 )
 
+                t_compute_start = time.time()
                 output = func(*args, **kwargs)
+                t_compute_elapsed = time.time() - t_compute_start
+                try:
+                    from verl.utils.profiler.performance import log_worker_compute
+
+                    log_worker_compute(func.__name__, t_compute_elapsed)
+                except Exception:
+                    pass
 
                 put_data = False
                 if isinstance(output, TensorDict):
@@ -357,7 +384,17 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
         async def async_inner(*args, **kwargs):
             batch_meta = _find_meta(*args, **kwargs)
             if batch_meta is None:
-                return await func(*args, **kwargs)
+                # Baseline path: measure pure compute time and report to TransferTimeLogger
+                t_compute_start = time.time()
+                result = await func(*args, **kwargs)
+                t_compute_elapsed = time.time() - t_compute_start
+                try:
+                    from verl.utils.profiler.performance import log_worker_compute
+
+                    log_worker_compute(func.__name__, t_compute_elapsed)
+                except Exception:
+                    pass  # profiling should never break training
+                return result
             else:
                 global TQ_INITIALIZED
                 if not TQ_INITIALIZED:
@@ -373,7 +410,15 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
                 )
 
+                t_compute_start = time.time()
                 output = await func(*args, **kwargs)
+                t_compute_elapsed = time.time() - t_compute_start
+                try:
+                    from verl.utils.profiler.performance import log_worker_compute
+
+                    log_worker_compute(func.__name__, t_compute_elapsed)
+                except Exception:
+                    pass
 
                 put_data = False
                 if isinstance(output, TensorDict):

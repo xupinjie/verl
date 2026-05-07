@@ -20,6 +20,7 @@ import aiohttp
 import numpy as np
 import ray
 import torch
+import torch.cuda.nvtx as nvtx
 from omegaconf import DictConfig, open_dict
 from PIL import Image
 from ray.actor import ActorHandle
@@ -148,12 +149,9 @@ class RewardLoopWorker:
     async def compute_score(self, data: DataProto) -> dict:
         assert len(data) == 1, "RewardLoopWorker only support single data item"
         if self.config.reward.custom_reward_function.path is not None:
-            # directly use user-customized reward function
             return await self.reward_manager.run_single(data)
         else:
             if self.config.reward.reward_model.enable:
-                # we assume the rm is disrm
-                # genrm must set custom_reward_function
                 return await self.compute_score_disrm(data)
             else:
                 return await self.reward_manager.run_single(data)
@@ -341,16 +339,19 @@ class RewardLoopManager:
             )
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
+        nvtx.range_push(f"reward_mgr::compute_rm_score(n={len(data)})")
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
         chunks = data.chunk(len(self.reward_loop_workers))
+        nvtx.range_push(f"reward_mgr::dispatch_workers(n_workers={len(self.reward_loop_workers)})")
         outputs = ray.get(
             [
                 worker.compute_score_batch.remote(chunk)
                 for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
             ]
         )
+        nvtx.range_pop()
         outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
@@ -376,6 +377,7 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()
 
+        nvtx.range_pop()  # compute_rm_score
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
         )
